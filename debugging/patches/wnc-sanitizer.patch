@@ -1,0 +1,159 @@
+diff --git a/app/services/generator.py b/app/services/generator.py
+index 8b13789..b1c2abc 100644
+--- a/app/services/generator.py
++++ b/app/services/generator.py
+@@ -1,6 +1,6 @@
+-import os, textwrap, json, re 
++import os, textwrap, json, re
+ from typing import List, Dict, Any
+ from openai import OpenAI
+ 
+ MODEL = os.environ.get("MODEL", "gpt-4o-mini")
+ client = OpenAI()
+@@
+ def _sanitize_markdown(md: str) -> str:
+-    s = md.replace("\r\n", "\n")
+-
+-    # Normalize spaces/dashes + strip zero-width chars
+-    s = (s.replace("\u00A0", " ")
+-           .replace("\u202F", " ")
+-           .replace("–", "-")
+-           .replace("—", "-"))
+-    s = re.sub(r"[\u200B-\u200D\u2060\uFEFF]", "", s)
+-
+-    # Fix '**Label. **' -> '**Label.**'
+-    s = re.sub(r'^\s*\*\*(.+?)\.\s*\*\*\s*$', r'**\1.**', s, flags=re_MULTILINE)
+-
+-    # Numeric formatting
+-    s = re.sub(r"(?<=\d),(?:\s|\n)+(?=\d)", ",", s)                # 250,\n000 or 6, 000 -> 250,000 / 6,000
+-    s = re.sub(r"(?<=\d)\s*-\s*(?=\d)", "-", s)                    # 6 - 10 -> 6-10
+-    s = re.sub(r"(?i)(\d[\d,]*(?:\.\d+)?)\s+([kmb])\b", r"\1\2", s)  # 10 k -> 10k (tighten unit)
+-    s = re.sub(r"(?i)(\$?\s*\d[\d,]*(?:\.\d+)?)\s*([kmb])\b", r"\1\2", s)  # $ 250 k -> $250k
+-    s = re.sub(r"(?i)(\d[\d,]*(?:\.\d+)?[kmb])(?=to\b)", r"\1 ", s) # 10kto -> 10k to
+-
+-    # Words split by linebreaks / hyphenation
+-    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)                         # micro-\n grants -> microgrants
+-    s = re.sub(r"(?<=\w)\n(?=\w)", " ", s)                         # micro\ngrants -> micro grants
+-    s = re.sub(r"([^\n])\n(?!\n|[#\-\*]|$)", r"\1 ", s)            # single newline inside paragraph -> space
+-
+-    # Spacing around punctuation/citations
+-    s = re.sub(r"\s+,", ",", s)                                    # " ," -> ","
+-    s = re.sub(r"(?<!\d),(?=\d{4}\b)", ", ", s)                    # add space after comma before YYYY (dates)
+-    s = re.sub(r"([.,;:!?])(?=\S)", r"\1 ", s)                     # "word,Next" -> "word, Next"
+-    s = re.sub(r"(\])(?=\w)", r"\1 ", s)                           # "]Your" -> "] Your"
+-
+-    # Digit/letter glue fixes (e.g., 240,000and400,000)
+-    s = re.sub(r"(?<=\d)(?=[A-Za-z])", " ", s)
+-    s = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", s)
+-
+-    # Collapse extras
+-    s = re.sub(r"[ \t]{2,}", " ", s)
+-    return s.strip()
++    s = md.replace("\r\n", "\n")
++
++    # --- Normalize ALL funky spaces to plain space first ---
++    # Includes en/em/thin/figure/narrow/ideographic spaces etc.
++    s = re.sub(r"[\u2000-\u200A\u202F\u205F\u3000]", " ", s)
++    # Strip zero-width chars
++    s = re.sub(r"[\u200B-\u200D\u2060\uFEFF]", "", s)
++
++    # Normalize dashes to hyphen
++    s = s.replace("–", "-").replace("—", "-")
++
++    # Fix '**Label. **' -> '**Label.**'
++    s = re.sub(r'^\s*\*\*(.+?)\.\s*\*\*\s*$', r'**\1.**', s, flags=re.MULTILINE)
++
++    # --- Numeric & money formatting ---
++    # 250,\n000 or 6, 000 -> 250,000 / 6,000
++    s = re.sub(r"(?<=\d),(?:\s|\n)+(?=\d)", ",", s)
++    # Tighten numeric ranges like 6 - 10 -> 6-10
++    s = re.sub(r"(?<=\d)\s*-\s*(?=\d)", "-", s)
++    # Tighten unit "k/m/b" with or without $: "10 k" -> "10k", "$ 250 k" -> "$250k"
++    s = re.sub(
++        r"(?i)\$?\s*(\d[\d,]*(?:\.\d+)?)\s*([kmb])\b",
++        lambda m: f"${m.group(1)}{m.group(2).lower()}"
++        if re.match(r"^\s*\$", m.group(0))
++        else f"{m.group(1)}{m.group(2).lower()}",
++        s,
++    )
++    # Add space after comma before a 4-digit year: "October 15,2025" -> "October 15, 2025"
++    s = re.sub(r"(?<=\d),(?=\d{4}\b)", ", ", s)
++    # If "10kto" appears, ensure a space before "to"
++    s = re.sub(r"(?i)(\d[\d,]*(?:\.\d+)?[kmb])(?=to\b)", r"\1 ", s)
++
++    # Words split by linebreaks / hyphenation
++    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)          # micro-\n grants -> microgrants
++    s = re.sub(r"(?<=\w)\n(?=\w)", " ", s)          # micro\ngrants -> micro grants
++    s = re.sub(r"([^\n])\n(?!\n|[#\-\*]|$)", r"\1 ", s)  # single newline inside paragraph -> space
++
++    # Spacing around punctuation/citations
++    s = re.sub(r"\s+,", ",", s)                     # " ," -> ","
++    s = re.sub(r"([.,;:!?])(?=\S)", r"\1 ", s)      # "word,Next" -> "word, Next"
++    s = re.sub(r"(\])(?=\w)", r"\1 ", s)            # "]Your" -> "] Your"
++
++    # Digit/letter glue fixes (e.g., 240,000and400,000)
++    s = re.sub(r"(?<=\d)(?=[A-Za-z])", " ", s)
++    s = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", s)
++
++    # Collapse extras
++    s = re.sub(r"[ \t]{2,}", " ", s)
++    return s.strip()
++
++def _sanitize_inline_text(x: str) -> str:
++    """Pre-clean short user inputs so odd Unicode/linebreaks don't propagate into prompts or outputs."""
++    if not x:
++        return x
++    s = _sanitize_markdown(x)
++    # Force single-line to avoid accidental headings/blocks from user pastes
++    s = re.sub(r"\s*\n\s*", " ", s)
++    return s.strip()
+@@
+ def generate_email(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Dict[str, Any]:
+-    context_blocks = _format_context_blocks(ctx) if ctx else "No context available."
++    context_blocks = _format_context_blocks(ctx) if ctx else "No context available."
++
++    # NEW: sanitize inbound user fields before building the prompt
++    payload = {
++        **payload,
++        "org_brief": _sanitize_inline_text(payload.get("org_brief", "")),
++        "campaign_brief": _sanitize_inline_text(payload.get("campaign_brief", "")),
++        "ask": _sanitize_inline_text(payload.get("ask", "")),
++        "deadline": _sanitize_inline_text(payload.get("deadline", "")),
++    }
+@@
+ def generate_narrative(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Dict[str, Any]:
+-    context_blocks = _format_context_blocks(ctx) if ctx else "No context available."
++    context_blocks = _format_context_blocks(ctx) if ctx else "No context available."
++
++    # NEW: sanitize inbound user fields before building the prompt
++    payload = {
++        **payload,
++        "org_brief": _sanitize_inline_text(payload.get("org_brief", "")),
++        "campaign_brief": _sanitize_inline_text(payload.get("campaign_brief", "")),
++        "ask": _sanitize_inline_text(payload.get("ask", "")),
++        "deadline": _sanitize_inline_text(payload.get("deadline", "")),
++    }
+diff --git a/ui/app.py b/ui/app.py
+index 2a1b2c3..4d5e6f7 100644
+--- a/ui/app.py
++++ b/ui/app.py
+@@ -8,12 +8,16 @@ API_URL = os.environ.get("API_URL", "http://127.0.0.1:8000")
+ 
+ st.set_page_config(page_title="WNC Proposal Assistant", layout="wide")
+ st.title("WNC Proposal Assistant — PoC")
+-st.markdown("""
+-<style>
+-/* Prevent long tokens from overflowing */
+-[data-testid="stMarkdown"] p { overflow-wrap: anywhere; }
+-</style>
+-""", unsafe_allow_html=True)
++st.markdown("""
++<style>
++/* Prevent long tokens from overflowing and normalize paragraph/list typography */
++[data-testid="stMarkdown"] p, [data-testid="stMarkdown"] li {
++  overflow-wrap: anywhere;
++  line-height: 1.55;
++  font-size: 1rem;
++}
++</style>
++""", unsafe_allow_html=True)

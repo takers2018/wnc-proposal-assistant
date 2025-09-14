@@ -1,0 +1,44 @@
+Metadata-Version: 2.4
+Name: wnc-proposal-assistant
+Version: 0.1.0
+Summary: PoC: AI-assisted donor email & grant narrative generator with lightweight RAG
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.110.0
+Requires-Dist: uvicorn[standard]>=0.27.0
+Requires-Dist: pydantic>=2.6.0
+Requires-Dist: python-dotenv>=1.0.1
+Requires-Dist: httpx>=0.27.0
+Requires-Dist: openai>=1.30.0
+Requires-Dist: tiktoken>=0.7.0
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: scikit-learn>=1.4.0
+Requires-Dist: streamlit>=1.33.0
+Requires-Dist: python-docx>=1.1.0
+
+# WNC Proposal Assistant (PoC)
+
+A one-week PoC that turns a short campaign brief + org facts into a polished donor email and a 1–2 page grant-style narrative, grounded in local citations via lightweight RAG.
+
+## Quickstart
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e .
+cp .env.example .env  # add your OPENAI_API_KEY
+make seed             # create minimal context.jsonl
+make api              # starts FastAPI on :8000
+make ui               # starts Streamlit on :8501
+```
+
+Open http://localhost:8501
+
+## Layout
+- `app/` FastAPI service (retrieval + generation + export stubs)
+- `ui/` Streamlit MVP
+- `data/processed/context.jsonl` lightweight knowledge base (citations)
+- `scripts/seed_minimal.py` writes a starter `context.jsonl`
+
+## Notes
+- This PoC computes embeddings at request-time for simplicity. For larger corpora, swap to a persistent vector store (Chroma/FAISS).
+- Do not put PII into `context.jsonl`. Keep sources and dates for transparency.

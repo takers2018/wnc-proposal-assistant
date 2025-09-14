@@ -1,0 +1,16 @@
+README.md
+pyproject.toml
+app/__init__.py
+app/main.py
+app/models/__init__.py
+app/models/schemas.py
+app/routes/__init__.py
+app/routes/generate.py
+app/services/__init__.py
+app/services/generator.py
+app/services/retriever.py
+wnc_proposal_assistant.egg-info/PKG-INFO
+wnc_proposal_assistant.egg-info/SOURCES.txt
+wnc_proposal_assistant.egg-info/dependency_links.txt
+wnc_proposal_assistant.egg-info/requires.txt
+wnc_proposal_assistant.egg-info/top_level.txt

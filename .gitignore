@@ -1,0 +1,33 @@
+﻿# venvs
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Editors
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# App secrets
+.env
+*.env
+
+# App data / outputs
+data/raw/
+data/processed/*.jsonl
+
+# Exports
+*.docx
+
+# Streamlit
+.streamlit/
