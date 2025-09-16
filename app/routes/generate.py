@@ -5,18 +5,20 @@ from app.services.generator import generate_email, generate_narrative
 import os
 
 router = APIRouter()
-KB_PATH = os.environ.get("KB_PATH", "data/processed/context.jsonl")
+KB_PATH = os.environ.get("KB_PATH", "data/processed")
 
 @router.post("/email", response_model=GenerateEmailResponse)
 def post_generate_email(req: GenerateRequest):
     query = f"{req.campaign_brief}\n{req.org_brief}"
-    ctx = retrieve(query=query, kb_path=KB_PATH, k=8, filters=None)
+    filters = req.filters.model_dump(exclude_none=True) if req.filters else None
+    ctx = retrieve(query=query, kb_path=KB_PATH, k=req.k, filters=filters)
     email = generate_email(payload=req.model_dump(), ctx=ctx)
     return {"email": email}
 
 @router.post("/narrative", response_model=GenerateNarrativeResponse)
 def post_generate_narrative(req: GenerateRequest):
     query = f"{req.campaign_brief}\n{req.org_brief}"
-    ctx = retrieve(query=query, kb_path=KB_PATH, k=10, filters=None)
+    filters = req.filters.model_dump(exclude_none=True) if req.filters else None
+    ctx = retrieve(query=query, kb_path=KB_PATH, k=req.k, filters=filters)
     narrative = generate_narrative(payload=req.model_dump(), ctx=ctx)
     return {"narrative": narrative}

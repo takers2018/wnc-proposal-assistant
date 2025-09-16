@@ -127,6 +127,38 @@ with st.sidebar:
     )
     tone = st.selectbox("Tone", ["urgent", "compassionate", "data-led", "hopeful"])
     api_url = st.text_input("API URL", API_URL)
+        # --- Retrieval Settings ---
+    st.sidebar.subheader("Retrieval Settings")
+    k = st.sidebar.slider("Top-K", min_value=1, max_value=20, value=8)
+
+    topic_options = ["small_business", "housing", "infrastructure", "education", "health"]
+    county_options = ["Haywood", "Buncombe", "Jackson", "Transylvania", "Madison"]
+
+    sel_topics   = st.sidebar.multiselect("Topics", topic_options, default=[])
+    sel_counties = st.sidebar.multiselect("Counties", county_options, default=[])
+
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        date_from = st.date_input("From", value=None)
+    with col2:
+        date_to = st.date_input("To", value=None)
+
+    filters = {
+        "topics": sel_topics or None,
+        "counties": sel_counties or None,
+        "date_from": date_from.isoformat() if date_from else None,
+        "date_to": date_to.isoformat() if date_to else None,
+    }
+    filters = {kk: vv for kk, vv in filters.items() if vv}  # drop empties
+
+    # Show active filters
+    active = []
+    if sel_topics: active.append(f"Topics: {', '.join(sel_topics)}")
+    if sel_counties: active.append(f"Counties: {', '.join(sel_counties)}")
+    if filters.get("date_from"): active.append(f"From: {filters['date_from']}")
+    if filters.get("date_to"):   active.append(f"To: {filters['date_to']}")
+    if active:
+        st.write(" ".join([f"`{a}`" for a in active]))
 
 def export_docx(title: str, content: str, api_url: str):
     r = httpx.post(
@@ -155,6 +187,8 @@ with col1:
                 "deadline": deadline,
                 "length": length,
                 "tone": tone,
+                "k": k,
+                "filters": filters,
             }
             r = httpx.post(f"{api_url}/generate/email", json=payload, timeout=120)
             r.raise_for_status()
@@ -174,6 +208,8 @@ with col2:
                 "deadline": deadline,
                 "length": length,
                 "tone": tone,
+                "k": k,
+                "filters": filters,
             }
             r = httpx.post(f"{api_url}/generate/narrative", json=payload, timeout=180)
             r.raise_for_status()

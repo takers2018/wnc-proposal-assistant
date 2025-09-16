@@ -3,6 +3,10 @@
 venv/
 env/
 
+# env
+.env
+*.env
+
 # Python
 __pycache__/
 *.py[cod]
@@ -31,3 +35,21 @@ data/processed/*.jsonl
 
 # Streamlit
 .streamlit/
+
+# local data
+data/raw/**
+data/processed/**
+!data/processed/README.md  # optional placeholder
+
+# caches / build
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# IDE
+.vscode/
+.idea/
+.venv/
+venv/
