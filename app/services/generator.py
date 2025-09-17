@@ -1,6 +1,9 @@
 import os, textwrap, json, re
-from typing import List, Dict, Any
+from dotenv import load_dotenv
+load_dotenv()
+from typing import List, Dict, Any, Tuple
 from openai import OpenAI
+from app.services.citations import build_sources, insert_markers_from_sequence
 
 MODEL = os.environ.get("MODEL", "gpt-4o-mini")
 client = OpenAI()
@@ -16,6 +19,40 @@ def _chat(messages, json_mode: bool = False):
         if json_mode:
             return client.chat.completions.create(model=MODEL, messages=messages, temperature=0.4).choices[0].message.content
         raise
+
+_URL_RE = re.compile(r"(https?://[^\s)>\]]+)", re.IGNORECASE)
+
+def _sanitize_preserve_urls(md: str) -> str:
+    if not md:
+        return md
+    urls = []
+    def _stash(m):
+        urls.append(m.group(1))
+        return f"__URL_{len(urls)-1}__"
+    md = _URL_RE.sub(_stash, md)
+
+    # ✅ Keep this section minimal; do NOT insert spaces around '.' or inside tokens.
+    # If you previously added any rules like "add spaces around dots", delete them.
+    # Example of safe normalizations:
+    md = md.replace("\u00A0", " ")
+
+    for i, u in enumerate(urls):
+        md = md.replace(f"__URL_{i}__", u)
+    return md
+
+def _strip_model_sources(md: str) -> str:
+    """Remove any model-written 'Sources' / 'References' sections."""
+    if not md:
+        return md
+    # Kill trailing 'Sources' headings and content
+    md = re.sub(r"(?is)\n+#+\s*(sources|references)\b.*$", "", md)
+    # Kill standalone lines like "Sources:" followed by anything
+    md = re.sub(r"(?im)^\s*(sources|references)\s*:\s*$.*", "", md)
+    return md
+
+def _paragraph_blocks(text: str) -> List[str]:
+    """Split by blank lines, keep non-empty paragraphs."""
+    return [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()] 
 
 SYSTEM_PROMPT_BASE = """
 You are a nonprofit fundraising writer serving Western North Carolina disaster recovery.
@@ -189,9 +226,8 @@ def generate_email(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Dict[s
     user_prompt = f"""
 Return ONLY valid JSON with these keys:
 - subjects: list of exactly 3 concise subject lines
-- body_md: the email body (150–220 words), include [n] citations inline
+- body_md: the email body (150–220 words)
 - ps: a one-sentence P.S. with a concrete next step
-- sources: list of objects with "label" and "url" that map the [n] markers
 
 Audience: {payload.get('audience')}
 Tone: {payload.get('tone')}
@@ -237,21 +273,32 @@ RETRIEVED CONTEXT
         sources = obj.get("sources") or []
         body_raw = obj.get("body_md") or ""
 
-    # ---- SANITIZE & DEDUPE P.S. ----
-    body = _sanitize_markdown(body_raw)
+    # ---- SANITIZE (preserve URLs), strip model-written Sources ----
+    body = _sanitize_preserve_urls(body_raw)
+    body = _strip_model_sources(body)
 
-    # strip any leading 'P.S.' the model might have added anyway
+    # ---- Build document map + sources from ctx ----
+    doc_to_n, sources_built = build_sources(ctx)
+
+    # ---- Pair paragraphs to chunks and insert [n] markers ----
+    paras = _paragraph_blocks(body)
+    blocks: List[Tuple[str, Dict[str, Any]]] = []
+    for i, p in enumerate(paras):
+        ch = ctx[min(i, len(ctx)-1)] if ctx else {}
+        blocks.append((p, ch))
+    body = insert_markers_from_sequence(blocks, doc_to_n)
+
+    # ---- DEDUPE / append P.S. exactly once ----
     ps = re.sub(r'^\s*P\.?\s*S\.?\s*:?\s*', '', ps_raw, flags=re.I).strip()
-
-    # only append a single, clean P.S. if the body doesn't already contain one
     if ps and not re.search(r'^\s*P\.?\s*S\.?\s*[:.]', body, flags=re.I | re.M):
         body = f"{body}\n\nP.S. {ps}"
-    
-    citations = sources or [{"label": d.get("title","source"), "url": d.get("source","")} for d in ctx]
+
+    # ---- Grounded citations (override any model sources) ----
+    citations = sources_built
 
     return {
         "subjects": subjects,
-        "body_md": body,          # already contains the single, deduped P.S. if present
+        "body_md": body,
         "citations": citations,
     }
 
@@ -267,7 +314,7 @@ def generate_narrative(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Di
     }
     user_prompt = f"""
 Write a grant-style narrative (350–650 words) with the exact section headings specified in the system prompt.
-Include [n] citations inline and end with a Sources list.
+Ground your writing in the retrieved context. Do not add a sources section.
 
 ORG BRIEF
 ---
@@ -296,7 +343,23 @@ RETRIEVED CONTEXT
         except Exception:
             pass
 
-    content = _sanitize_narrative_markdown(content)
-    citations = [{"label": d.get("title","source"), "url": d.get("source","")} for d in ctx]
+    # ---- SANITIZE (preserve URLs), strip any model-written Sources ----
+    content = _sanitize_preserve_urls(content)
+    content = _strip_model_sources(content)
+
+    # ---- Build document map + sources from ctx ----
+    doc_to_n, sources_built = build_sources(ctx)
+
+    # ---- Pair paragraphs to chunks and insert [n] markers ----
+    paras = _paragraph_blocks(content)
+    blocks: List[Tuple[str, Dict[str, Any]]] = []
+    for i, p in enumerate(paras):
+        ch = ctx[min(i, len(ctx)-1)] if ctx else {}
+        blocks.append((p, ch))
+    content = insert_markers_from_sequence(blocks, doc_to_n)
+
+    # ---- Grounded citations ----
+    citations = sources_built
+
     return {"body_md": content, "citations": citations}
 
