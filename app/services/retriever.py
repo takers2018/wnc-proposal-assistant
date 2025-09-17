@@ -71,18 +71,19 @@ def _embed_query(text: str) -> np.ndarray:
     v = v / (np.linalg.norm(v) + 1e-12)
     return v.reshape(1, -1)
 
+# Accept plural/singular keys and flat dates → nested
 def _normalize_filters(f: Optional[Dict]) -> Optional[Dict]:
     if not f:
         return f
     f = dict(f)  # shallow copy
 
-    # plural -> singular keys used internally
+    # plural -> singular keys used internally by _apply_filters()
     if "topics" in f and "topic" not in f:
         f["topic"] = f.pop("topics")
     if "counties" in f and "county" not in f:
         f["county"] = f.pop("counties")
 
-    # flat dates -> nested dict
+    # flat date_from/date_to -> nested
     if "date_from" in f or "date_to" in f:
         f["date"] = {
             "from": f.pop("date_from", None),
@@ -90,12 +91,9 @@ def _normalize_filters(f: Optional[Dict]) -> Optional[Dict]:
         }
 
     # strip empties
-    if "topic" in f and not f["topic"]:
-        f.pop("topic")
-    if "county" in f and not f["county"]:
-        f.pop("county")
-    if "date" in f and not any(f["date"].values()):
-        f.pop("date")
+    if "topic"  in f and not f["topic"]:  f.pop("topic")
+    if "county" in f and not f["county"]: f.pop("county")
+    if "date"   in f and not any((f["date"] or {}).values()): f.pop("date")
     return f
 
 def _apply_filters(mask_idx: np.ndarray, filters: Optional[Dict]) -> np.ndarray:
@@ -163,13 +161,20 @@ def retrieve(query: str, kb_path: str = "data/processed", k: int = 8, filters: O
         # filtered (or no faiss): numpy fallback
         idxs, sims = _topk_numpy(q, filt_idx, k)
 
+
     out = []
     for i in idxs:
         c = _CHUNKS[int(i)]
         out.append({
+            "doc_id": c.get("doc_id") or "",
             "title": c.get("title") or c.get("doc_id") or "Source",
-            "source": c.get("url") or "",
+            # provide both 'url' (preferred) and 'source' (BC for older UI)
+            "url": c.get("url") or "",
+            "source": c.get("url") or "",   # keep for backward compatibility
             "date": c.get("date") or "",
+            "county": c.get("county") or "",
+            "topics": c.get("topics", []),
             "text": c.get("text") or "",
         })
     return out
+

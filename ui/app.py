@@ -192,10 +192,20 @@ with col1:
             }
             r = httpx.post(f"{api_url}/generate/email", json=payload, timeout=120)
             r.raise_for_status()
-            email = r.json()["email"]
-            st.session_state["email_md"] = email["body_md"]
+            resp = r.json()
+            email = resp["email"]
+
+            # Main fields
+            st.session_state["email_md"] = email.get("body_md", "")
             st.session_state["email_subjects"] = email.get("subjects", [])
             st.session_state["email_sources"] = email.get("citations", [])
+
+            # Store k for the Top-K badge (prefer backend, else local UI value, else 8)
+            st.session_state["k"] = resp.get("k") or locals().get("k") or st.session_state.get("k") or 8
+
+            # Optional: if backend returns chunks for debug, keep them
+            if "chunks" in resp:
+                st.session_state["returned_chunks"] = resp["chunks"]
 
 with col2:
     if st.button("Generate 1–2 Page Narrative", use_container_width=True):
@@ -213,12 +223,25 @@ with col2:
             }
             r = httpx.post(f"{api_url}/generate/narrative", json=payload, timeout=180)
             r.raise_for_status()
-            nar_json = r.json()["narrative"]
+            resp = r.json()
+            narrative = resp["narrative"]
 
-            st.session_state["narrative_md"] = nar_json["body_md"]
-            st.session_state["narrative_sources"] = nar_json.get("citations", [])  # <— stash here
+            st.session_state["narrative_md"] = narrative.get("body_md", "")
+            st.session_state["narrative_sources"] = narrative.get("citations", [])
+
+            # Keep k in session (prefer backend, else local UI value, else prior/default)
+            st.session_state["k"] = resp.get("k") or locals().get("k") or st.session_state.get("k") or 8
+
+            # Optional: if backend returns chunks for debug, keep them
+            if "chunks" in resp:
+                st.session_state["returned_chunks"] = resp["chunks"]
 
 st.divider()
+
+# --- Tiny debug: show Top-K last used (fallback to 8) ---
+k_val = st.session_state.get("k") or 8
+st.caption(f"Top-K: {k_val}")
+
 colA, colB = st.columns(2)
 with colA:
 
@@ -306,4 +329,12 @@ with colB:
 
     with st.expander("Debug: show raw narrative markdown", expanded=False):
         st.code(st.session_state.get("narrative_md", ""), language="markdown")
+
+    # --- Optional debug: list titles/URLs of returned chunks if backend includes them ---
+    with st.expander("Debug: returned chunks (titles/URLs)", expanded=False):
+        for ch in st.session_state.get("returned_chunks", []):
+            title = ch.get('title') or ch.get('meta', {}).get('title') or 'Source'
+            # Prefer 'source' (what the retriever returns), fall back to any 'url' field
+            url = ch.get('source') or ch.get('url') or ch.get('meta', {}).get('url') or ''
+            st.write(f"- {title} — {url}")
 
