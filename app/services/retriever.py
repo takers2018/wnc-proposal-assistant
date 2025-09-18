@@ -3,9 +3,29 @@ import os, json
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
+from typing import Any
+
+def _dedupe_adjacent_by_doc(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out, prev_doc = [], None
+    for h in hits:
+        doc = h.get("doc_id")
+        if doc and doc == prev_doc:
+            continue
+        out.append(h)
+        prev_doc = doc
+    return out
+
 import numpy as np
 from dotenv import load_dotenv, dotenv_values
 from openai import OpenAI
+
+from datetime import datetime
+
+def _parse_iso_or_none(s: Optional[str]):
+    try:
+        return datetime.fromisoformat(s) if s else None
+    except Exception:
+        return None
 
 # Optional FAISS
 try:
@@ -117,10 +137,18 @@ def _apply_filters(mask_idx: np.ndarray, filters: Optional[Dict]) -> np.ndarray:
         if topics:
             c_topics = [str(t).lower() for t in c.get("topics", [])]
             ok = ok and bool(set(c_topics) & topics)
+        # strict date window: undated chunks FAIL when a date filter is present
         if (from_dt or to_dt):
-            d = (c.get("date") or "")
-            if from_dt and (not d or d < from_dt): ok = False
-            if to_dt   and (not d or d > to_dt):   ok = False
+            d  = _parse_iso_or_none(c.get("date"))
+            df = _parse_iso_or_none(from_dt) if from_dt else None
+            dt_ = _parse_iso_or_none(to_dt) if to_dt else None
+
+            if d is None:
+                ok = False
+            else:
+                if df and d < df:   ok = False
+                if dt_ and d > dt_: ok = False
+
         if ok:
             selected.append(i)
     return np.array(selected, dtype=np.int64) if selected else np.array([], dtype=np.int64)
@@ -151,16 +179,27 @@ def retrieve(query: str, kb_path: str = "data/processed", k: int = 8, filters: O
     # apply filters
     filt_idx = _apply_filters(all_idx, filters) if filters else all_idx
 
+    # STRICT: if any filter was provided and nothing matched, do NOT fall back
+    if filters and (getattr(filt_idx, "size", None) == 0 or len(getattr(filt_idx, "__array_interface__", None) and filt_idx or []) == 0):
+        return []
+
+    # STRICT: if any filter present and nothing matched, return no results (no fallback)
+    if filters and filt_idx.size == 0:
+        return []
+
+    # compute how many to pull *before* dedupe (strict over the filtered pool)
+    pool_size = int(filt_idx.size) if filters else len(_CHUNKS)
+    request_k = min(int(k), pool_size)
+    
     # choose engine
     if filt_idx.size == len(_CHUNKS) and _FAISS is not None:
         # unrestricted: use faiss for speed
-        D, I = _FAISS.search(q, min(k, len(_CHUNKS)))
+        D, I = _FAISS.search(q, request_k)
         idxs = I.ravel()
         sims = D.ravel()
     else:
         # filtered (or no faiss): numpy fallback
-        idxs, sims = _topk_numpy(q, filt_idx, k)
-
+        idxs, sims = _topk_numpy(q, filt_idx, request_k)
 
     out = []
     for i in idxs:
@@ -169,12 +208,14 @@ def retrieve(query: str, kb_path: str = "data/processed", k: int = 8, filters: O
             "doc_id": c.get("doc_id") or "",
             "title": c.get("title") or c.get("doc_id") or "Source",
             # provide both 'url' (preferred) and 'source' (BC for older UI)
-            "url": c.get("url") or "",
-            "source": c.get("url") or "",   # keep for backward compatibility
-            "date": c.get("date") or "",
-            "county": c.get("county") or "",
-            "topics": c.get("topics", []),
+            "url": c.get("url") or None,     # Optional[HttpUrl] plays nicer with None
+            "source": c.get("url") or "",    # legacy BC
+            "date": c.get("date") or None,   # IMPORTANT: None, not ""
+            "county": c.get("county") or None,
+            "topics": (c.get("topics") or []),
             "text": c.get("text") or "",
         })
-    return out
+    out = _dedupe_adjacent_by_doc(out)
+    return out[:k]
+
 

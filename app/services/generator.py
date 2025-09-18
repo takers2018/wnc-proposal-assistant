@@ -4,6 +4,7 @@ load_dotenv()
 from typing import List, Dict, Any, Tuple
 from openai import OpenAI
 from app.services.citations import build_sources, insert_markers_from_sequence
+from app.services.postprocess import rebuild_sources_in_marker_order, sanitize_on_no_sources
 
 MODEL = os.environ.get("MODEL", "gpt-4o-mini")
 client = OpenAI()
@@ -213,6 +214,14 @@ def _format_context_blocks(ctx: List[Dict[str, Any]]) -> str:
         blocks.append(f"[{i}] {title} ({date})\n{snippet}\nURL: {d.get('source','')}")
     return "\n\n".join(blocks)
 
+def finalize_output(body_md: str, sources: list[dict]) -> tuple[str, list[dict]]:
+    """
+    Renumber [n] markers to match first-use order and reorder sources to 1..m.
+    Assumes body_md already has [n] markers and 'sources' was built from ctx.
+    """
+    body_md, sources = rebuild_sources_in_marker_order(body_md, sources)
+    return body_md, sources
+
 def generate_email(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Dict[str, Any]:
     context_blocks = _format_context_blocks(ctx) if ctx else "No context available."
         # sanitize inbound user fields before building the prompt
@@ -224,32 +233,35 @@ def generate_email(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Dict[s
         "deadline": _sanitize_inline_text(payload.get("deadline", "")),
     }
     user_prompt = f"""
-Return ONLY valid JSON with these keys:
-- subjects: list of exactly 3 concise subject lines
-- body_md: the email body (150–220 words)
-- ps: a one-sentence P.S. with a concrete next step
+    Return ONLY valid JSON with these keys:
+    - subjects: list of exactly 3 concise subject lines
+    - body_md: the email body (150–220 words)
+    - ps: a one-sentence P.S. with a concrete next step
 
-Audience: {payload.get('audience')}
-Tone: {payload.get('tone')}
-Ask amount or range: {payload.get('ask')}
-Deadline/urgency note: {payload.get('deadline')}
+    Audience: {payload.get('audience')}
+    Tone: {payload.get('tone')}
+    Ask amount or range: {payload.get('ask')}
+    Deadline/urgency note: {payload.get('deadline')}
 
-ORG BRIEF
----
-{payload.get('org_brief')}
+    ORG BRIEF
+    ---
+    {payload.get('org_brief')}
 
-CAMPAIGN BRIEF
----
-{payload.get('campaign_brief')}
+    CAMPAIGN BRIEF
+    ---
+    {payload.get('campaign_brief')}
 
-RETRIEVED CONTEXT
----
-{context_blocks}
-"""
+    RETRIEVED CONTEXT
+    ---
+    {context_blocks}
+    """
     messages = [
         {"role": "system", "content": EMAIL_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
+
+    if not ctx:
+        user_prompt += "\n\nNo citations available. Do not include bracketed citations or a Sources section."
 
     raw = _chat(messages, json_mode=True)  # try JSON mode first
 
@@ -280,27 +292,35 @@ RETRIEVED CONTEXT
     # ---- Build document map + sources from ctx ----
     doc_to_n, sources_built = build_sources(ctx)
 
-    # ---- Pair paragraphs to chunks and insert [n] markers ----
-    paras = _paragraph_blocks(body)
-    blocks: List[Tuple[str, Dict[str, Any]]] = []
-    for i, p in enumerate(paras):
-        ch = ctx[min(i, len(ctx)-1)] if ctx else {}
-        blocks.append((p, ch))
-    body = insert_markers_from_sequence(blocks, doc_to_n)
+    # ---- If we have sources, insert markers; otherwise skip safely ----
+    if sources_built:
+        paras = _paragraph_blocks(body)
+        blocks: List[Tuple[str, Dict[str, Any]]] = []
+        for i, p in enumerate(paras):
+            ch = ctx[min(i, len(ctx)-1)] if ctx else {}
+            blocks.append((p, ch))
+        body = insert_markers_from_sequence(blocks, doc_to_n)
 
     # ---- DEDUPE / append P.S. exactly once ----
     ps = re.sub(r'^\s*P\.?\s*S\.?\s*:?\s*', '', ps_raw, flags=re.I).strip()
     if ps and not re.search(r'^\s*P\.?\s*S\.?\s*[:.]', body, flags=re.I | re.M):
         body = f"{body}\n\nP.S. {ps}"
 
-    # ---- Grounded citations (override any model sources) ----
-    citations = sources_built
+    # ---- Grounded citations ----
+    citations = sources_built if sources_built else []
+
+    # ---- If no sources, remove any stray [n] and 'Sources' sections ----
+    body, citations = sanitize_on_no_sources(body, citations)
+
+    # ---- Finalize once: renumber [n] and reorder sources ----
+    body, citations = finalize_output(body, citations)
 
     return {
         "subjects": subjects,
         "body_md": body,
         "citations": citations,
     }
+
 
 def generate_narrative(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Dict[str, Any]:
     context_blocks = _format_context_blocks(ctx) if ctx else "No context available."
@@ -313,25 +333,29 @@ def generate_narrative(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Di
         "deadline": _sanitize_inline_text(payload.get("deadline", "")),
     }
     user_prompt = f"""
-Write a grant-style narrative (350–650 words) with the exact section headings specified in the system prompt.
-Ground your writing in the retrieved context. Do not add a sources section.
+    Write a grant-style narrative (350–650 words) with the exact section headings specified in the system prompt.
+    Ground your writing in the retrieved context. Do not add a sources section.
 
-ORG BRIEF
----
-{payload.get('org_brief')}
+    ORG BRIEF
+    ---
+    {payload.get('org_brief')}
 
-CAMPAIGN BRIEF
----
-{payload.get('campaign_brief')}
+    CAMPAIGN BRIEF
+    ---
+    {payload.get('campaign_brief')}
 
-RETRIEVED CONTEXT
----
-{context_blocks}
-"""
+    RETRIEVED CONTEXT
+    ---
+    {context_blocks}
+    """
     messages = [
         {"role": "system", "content": NARRATIVE_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
+
+    if not ctx:
+        user_prompt += "\n\nNo citations available. Do not include bracketed citations or a Sources section."
+
     resp = client.chat.completions.create(model=MODEL, messages=messages, temperature=0.4)
     content = resp.choices[0].message.content
 
@@ -350,16 +374,22 @@ RETRIEVED CONTEXT
     # ---- Build document map + sources from ctx ----
     doc_to_n, sources_built = build_sources(ctx)
 
-    # ---- Pair paragraphs to chunks and insert [n] markers ----
-    paras = _paragraph_blocks(content)
-    blocks: List[Tuple[str, Dict[str, Any]]] = []
-    for i, p in enumerate(paras):
-        ch = ctx[min(i, len(ctx)-1)] if ctx else {}
-        blocks.append((p, ch))
-    content = insert_markers_from_sequence(blocks, doc_to_n)
+    # ---- If we have sources, insert markers; otherwise skip safely ----
+    if sources_built:
+        paras = _paragraph_blocks(content)
+        blocks: List[Tuple[str, Dict[str, Any]]] = []
+        for i, p in enumerate(paras):
+            ch = ctx[min(i, len(ctx)-1)] if ctx else {}
+            blocks.append((p, ch))
+        content = insert_markers_from_sequence(blocks, doc_to_n)
 
     # ---- Grounded citations ----
-    citations = sources_built
+    citations = sources_built if sources_built else []
+
+    # ---- If no sources, remove any stray [n] and 'Sources' sections ----
+    content, citations = sanitize_on_no_sources(content, citations)
+
+    # ---- Finalize once: renumber [n] and reorder sources ----
+    content, citations = finalize_output(content, citations)
 
     return {"body_md": content, "citations": citations}
-
