@@ -3,6 +3,8 @@ import streamlit as st
 import httpx, os
 import re 
 import streamlit.components.v1 as components
+import requests
+from datetime import date
 
 def _escape_streamlit_math(md: str) -> str:
     if not md:
@@ -85,17 +87,38 @@ def _domain(url: str) -> str:
         return ""
 
 def render_sources_ol(sources):
-    """Return an HTML <ol> of sources with anchors (#src-n)."""
+    """Return an HTML <ol> of sources with anchors (#src-n) plus optional county/topic badges."""
     if not sources:
         return ""
     items = []
     for i, src in enumerate(sources, start=1):
-        label = html.escape(src.get("label") or f"Source {i}")
+        title = src.get("title") or src.get("label") or f"Source {i}"
         url = (src.get("url") or "").strip()
+        county = (src.get("county") or "").strip()
+        topics = src.get("topics") or []
+
+        title_html = html.escape(title)
         url_attr = html.escape(url)
+
+        # domain hint
         dom = _domain(url)
         dom_html = f' <span class="src-domain">({html.escape(dom)})</span>' if dom else ""
-        items.append(f'<li id="src-{i}"><a href="{url_attr}" target="_blank" rel="noopener">{label}</a>{dom_html}</li>')
+
+        # badges
+        badges = []
+        if county:
+            badges.append(f'<span class="badge" style="margin-left:.35rem;border:1px solid #ddd;border-radius:6px;padding:0 .35rem;font-size:.85em;">{html.escape(county)}</span>')
+        for t in topics:
+            if str(t).strip():
+                badges.append(f'<span class="badge" style="margin-left:.25rem;border:1px solid #eee;border-radius:6px;padding:0 .35rem;font-size:.82em;">{html.escape(str(t))}</span>')
+        badges_html = "".join(badges)
+
+        items.append(
+            f'<li id="src-{i}">'
+            f'<a href="{url_attr}" target="_blank" rel="noopener">{title_html}</a>'
+            f'{dom_html}{badges_html}'
+            f'</li>'
+        )
     return '<div class="sources"><h4>Sources</h4><ol>' + "".join(items) + "</ol></div>"
 
 def linkify_markers(md: str, sources):
@@ -193,12 +216,20 @@ with col1:
             r = httpx.post(f"{api_url}/generate/email", json=payload, timeout=120)
             r.raise_for_status()
             resp = r.json()
-            email = resp["email"]
+            email = resp.get("email") or {}
 
-            # Main fields
-            st.session_state["email_md"] = email.get("body_md", "")
-            st.session_state["email_subjects"] = email.get("subjects", [])
-            st.session_state["email_sources"] = email.get("citations", [])
+            # Tolerate both new typed and legacy keys
+            email_md = resp.get("email_md") or email.get("body_md", "")
+            email_sources = resp.get("email_sources") or email.get("citations", [])
+            email_subjects = (email.get("subjects") or resp.get("subjects") or [])
+
+            # Main fields → session
+            st.session_state["email_md"] = email_md
+            st.session_state["email_subjects"] = email_subjects
+            st.session_state["email_sources"] = email_sources
+
+            # Optional: keep last raw API response for debugging
+            st.session_state["resp_email_raw"] = resp
 
             # Store k for the Top-K badge (prefer backend, else local UI value, else 8)
             st.session_state["k"] = resp.get("k") or locals().get("k") or st.session_state.get("k") or 8
@@ -224,10 +255,18 @@ with col2:
             r = httpx.post(f"{api_url}/generate/narrative", json=payload, timeout=180)
             r.raise_for_status()
             resp = r.json()
-            narrative = resp["narrative"]
+            narrative = resp.get("narrative") or {}
 
-            st.session_state["narrative_md"] = narrative.get("body_md", "")
-            st.session_state["narrative_sources"] = narrative.get("citations", [])
+            # Tolerate both new typed and legacy keys
+            narr_md = resp.get("narrative_md") or narrative.get("body_md", "")
+            narr_sources = resp.get("narrative_sources") or narrative.get("citations", [])
+
+            # Session
+            st.session_state["narrative_md"] = narr_md
+            st.session_state["narrative_sources"] = narr_sources
+
+            # Optional: keep last raw API response for debugging
+            st.session_state["resp_narr_raw"] = resp
 
             # Keep k in session (prefer backend, else local UI value, else prior/default)
             st.session_state["k"] = resp.get("k") or locals().get("k") or st.session_state.get("k") or 8
@@ -268,6 +307,10 @@ with colA:
     else:
         st.markdown("_No email yet_")
 
+    # Tiny toast if no citations
+    if st.session_state.get("email_md") and not st.session_state.get("email_sources"):
+        st.info("No citations returned for this run.")
+
     if st.session_state.get("email_md"):
         if st.button("Export Email to Docx", key="btn_export_email"):
             data = export_docx("Donor_Email", st.session_state["email_md"], api_url)
@@ -289,6 +332,13 @@ with colA:
     with st.expander("Debug: show raw email markdown", expanded=False):
         st.code(st.session_state.get("email_md", ""), language="markdown")
 
+    with st.expander("Response (debug)"):
+        st.json({
+            "email_md": st.session_state.get("email_md", ""),
+            "email_sources": st.session_state.get("email_sources", []),
+            # If you kept the raw API response:
+            "raw": st.session_state.get("resp_email_raw", {}),
+        })
 
 with colB:
     st.subheader("Grant Narrative (Markdown)")
@@ -307,8 +357,13 @@ with colB:
         copy_button("Copy Narrative", narr_md, key="copy_narr")
 
         st.markdown(render_sources_ol(narr_sources), unsafe_allow_html=True)
+    
     else:
         st.markdown("_No narrative yet_")
+
+    # Tiny toast if no citations
+    if st.session_state.get("narrative_md") and not st.session_state.get("narrative_sources"):
+        st.info("No citations returned for this run.")
 
     if st.session_state.get("narrative_md"):
         if st.button("Export Narrative to Docx", key="btn_export_narrative"):
@@ -329,6 +384,14 @@ with colB:
 
     with st.expander("Debug: show raw narrative markdown", expanded=False):
         st.code(st.session_state.get("narrative_md", ""), language="markdown")
+
+    with st.expander("Response (debug)"):
+        st.json({
+            "narrative_md": st.session_state.get("narrative_md", ""),
+            "narrative_sources": st.session_state.get("narrative_sources", []),
+            # If you kept the raw API response:
+            "raw": st.session_state.get("resp_narr_raw", {}),
+        })
 
     # --- Optional debug: list titles/URLs of returned chunks if backend includes them ---
     with st.expander("Debug: returned chunks (titles/URLs)", expanded=False):

@@ -8,6 +8,8 @@ import numpy as np
 from dotenv import load_dotenv, dotenv_values
 from openai import OpenAI
 
+import hashlib
+
 # Optional deps (graceful if missing)
 try:
     import fitz  # PyMuPDF
@@ -210,6 +212,9 @@ def main():
     ap.add_argument("--max-doc-chars", type=int, default=DEFAULT_MAX_DOC_CHARS, help="Max chars per doc after cleaning")
 
     args = ap.parse_args()
+    iso_date = args.date or None
+    county = args.county or None
+    topics = args.topic or []
 
     if not API_KEY:
         raise SystemExit("OPENAI_API_KEY not found. Put it in .env or environment.")
@@ -231,9 +236,9 @@ def main():
             "id": f"pdf::{path.name}",
             "title": path.stem,
             "url": file_uri(path),
-            "date": args.date,
-            "county": args.county,
-            "topics": args.topic,
+            "date": iso_date,
+            "county": county,
+            "topics": topics,
             "text": text,
             "source_type": "pdf",
         })
@@ -250,9 +255,9 @@ def main():
             "id": f"docx::{path.name}",
             "title": path.stem,
             "url": file_uri(path),
-            "date": args.date,
-            "county": args.county,
-            "topics": args.topic,
+            "date": iso_date,
+            "county": county,
+            "topics": topics,
             "text": text,
             "source_type": "docx",
         })
@@ -266,13 +271,14 @@ def main():
         except Exception as e:
             print(f"[WARN] fetch failed for {u}: {e}")
             continue
+        doc_id = "doc::" + hashlib.sha1(u.encode()).hexdigest()[:10]
         documents.append({
-            "id": f"url::{u}",
+            "id": doc_id,
             "title": obj["title"],
             "url": u,
-            "date": args.date,
-            "county": args.county,
-            "topics": args.topic,
+            "date": iso_date,
+            "county": county,
+            "topics": topics,
             "text": obj["text"],
             "source_type": "url",
         })

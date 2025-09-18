@@ -23,14 +23,18 @@ def main():
 
     chunks = rtr.retrieve(args.query, k=args.k, filters=filters)
     print(f"Top-{args.k} for: {args.query}")
-    for i, ch in enumerate(chunks, 1):
-        title = (ch.get('title')
-                 or ch.get('meta', {}).get('title')
-                 or 'Source')
-        url = (ch.get('url')
-               or ch.get('meta', {}).get('url')
-               or '')
-        print(f"{i:>2}. {title}  —  {url}")
+    seen = set()
+    rank = 1
+    for ch in chunks:
+        doc_id = ch.get("doc_id") or f"{ch.get('source','')}|{ch.get('title','Source')}"
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        title = ch.get("title") or "Source"
+        url = ch.get("source") or ""
+        print(f"{rank:>2}. {title}  —  {url}")
+        rank += 1
+
 
 if __name__ == "__main__":
     main()
