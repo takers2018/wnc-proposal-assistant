@@ -17,6 +17,16 @@ app.add_middleware(
 app.include_router(generate_router, prefix="/generate", tags=["generate"])
 app.include_router(export_router,  prefix="/export",   tags=["export"])
 
+@app.get("/", tags=["health"])
+def root():
+    return {
+        "name": "WNC Proposal Assistant API",
+        "version": "0.1.0",
+        "status": "ok",
+        "openapi": "/openapi.json",
+        "docs": "/docs",
+    }
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True}

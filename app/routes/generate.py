@@ -1,8 +1,6 @@
-# app/routes/generate.py
-
-from fastapi import APIRouter
-from typing import List, Dict, Any, Optional
-import os
+from fastapi import APIRouter, Request
+from typing import Any, Dict, Optional
+import os, logging, re, hashlib
 
 from app.models.schemas import (
     GenerateRequest,
@@ -15,123 +13,125 @@ from app.models.schemas import (
 from app.services.retriever import retrieve
 from app.services.generator import generate_email, generate_narrative
 
-# If app/main.py already mounts this with prefix="/generate",
-# keep router = APIRouter(). Otherwise you can set: APIRouter(prefix="/generate", tags=["generate"])
 router = APIRouter()
-
 KB_PATH = os.environ.get("KB_PATH", "data/processed")
-
-
-import re, logging, hashlib
 logger = logging.getLogger(__name__)
+
+def _normalize_rf(rf_in: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if rf_in is None:
+        return {"date_from": None, "date_to": None, "counties": None, "topics": None}
+    rf = dict(rf_in)
+    out = {"date_from": None, "date_to": None, "counties": None, "topics": None}
+    if isinstance(rf.get("date"), dict):
+        out["date_from"] = rf["date"].get("from")
+        out["date_to"]   = rf["date"].get("to")
+    else:
+        out["date_from"] = rf.get("date_from")
+        out["date_to"]   = rf.get("date_to")
+    out["counties"] = rf.get("counties") or rf.get("county")
+    out["topics"]   = rf.get("topics")   or rf.get("topic")
+    return out
 
 def _map_citations(raw_list):
     norm = []
     for s in (raw_list or []):
-        d = dict(s)  # shallow copy
-
-        # title: accept 'label' fallback
-        if not d.get("title"):
-            d["title"] = d.get("label") or "Source"
-
-        # marker: accept legacy 'n'
-        if d.get("n") is not None and d.get("marker") is None:
-            d["marker"] = d["n"]
-
-        # url: empty string → None for Optional[HttpUrl]
-        url = (d.get("url") or "").strip()
-        d["url"] = url or None
-
-        # date: must be YYYY-MM-DD or None
-        dv = d.get("date")
-        if not dv or not re.match(r"^\d{4}-\d{2}-\d{2}$", str(dv)):
-            d["date"] = None
-
-        # topics: normalize to list[str]
-        tv = d.get("topics")
-        if tv is None:
-            d["topics"] = []
-        elif not isinstance(tv, list):
-            d["topics"] = [str(tv)]
-        else:
-            d["topics"] = [str(x) for x in tv if str(x).strip()]
-
-        # ---- ensure doc_id (required) ----
+        d = dict(s)
+        if not d.get("title"): d["title"] = d.get("label") or "Source"
+        if d.get("n") is not None and d.get("marker") is None: d["marker"] = d["n"]
+        url = (d.get("url") or "").strip(); d["url"] = url or None
+        dv = d.get("date"); d["date"] = dv if dv and re.match(r"^\d{4}-\d{2}-\d{2}$", str(dv)) else None
+        tv = d.get("topics"); d["topics"] = [str(x) for x in (tv if isinstance(tv, list) else [tv] if tv else []) if str(x).strip()]
         if not d.get("doc_id"):
-            if url:
-                d["doc_id"] = f"url::{url}"
-            else:
-                # stable-ish fallback from title (+ marker if present)
-                seed = (d.get("title") or "") + "|" + str(d.get("marker") or "")
-                d["doc_id"] = "doc::" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
-
+            d["doc_id"] = f"url::{url}" if url else "doc::" + hashlib.sha1(((d.get("title") or "") + "|" + str(d.get("marker") or "")).encode()).hexdigest()[:12]
         try:
             norm.append(SourceItem(**d))
         except Exception:
             logger.exception("Bad citation payload after normalization: %r", d)
-            # Skip malformed entries instead of 500-ing the whole response
     return norm
 
 @router.post("/email", response_model=GenerateEmailResponseCompat)
-def post_generate_email(req: GenerateRequest):
+async def post_generate_email(req: GenerateRequest, request: Request):
+    print("[DBG] route: app/routes/generate.py -> post_generate_email invoked")
+
+    # 1) Read the full raw JSON so unknown fields aren't dropped by Pydantic
+    raw = await request.json()
+    # One-run debug to verify what keys the harness sends:
+    print(f"[DBG] raw keys: {list(raw.keys())}")
+
+    # 2) Accept multiple places/casings for filters
+    rf_raw = (
+        raw.get("retrieve_filters")
+        or raw.get("retrieveFilters")
+        or raw.get("filters")
+        or (raw.get("options", {}) or {}).get("retrieve_filters")
+        or (raw.get("options", {}) or {}).get("retrieveFilters")
+        or None
+    )
+
+    # 3) Normalize nested/flat → {date_from,date_to,counties,topics}
+    RF = _normalize_rf(rf_raw)
+    # Extra: if camelCase date keys were used, pick them up
+    if RF["date_from"] is None and isinstance(rf_raw, dict) and "dateFrom" in rf_raw:
+        RF["date_from"] = rf_raw.get("dateFrom")
+    if RF["date_to"] is None and isinstance(rf_raw, dict) and "dateTo" in rf_raw:
+        RF["date_to"] = rf_raw.get("dateTo")
+    print(f"[DBG] route RF={RF!r}")
+
+    # 4) Retrieval WITH filters (critical for no-match behavior)
     query = f"{req.campaign_brief}\n{req.org_brief}"
-    filters = req.filters.model_dump(exclude_none=True) if req.filters else None
+    k = req.k or 8
+    ctx = retrieve(query=query, kb_path=KB_PATH, k=k, filters=RF)
 
-    try:
-        ctx = retrieve(query=query, kb_path=KB_PATH, k=req.k, filters=filters)
-    except FileNotFoundError:
-        # Empty-store friendly: return BOTH typed object and legacy keys.
-        empty_email = EmailPiece(subjects=[], body_md="", citations=[])
-        return {
-            "email": empty_email,
-            "email_md": empty_email.body_md,         # legacy
-            "email_sources": [],                     # legacy
-        }
+    # 5) Generator payload includes the same filters (defensive re-filter downstream)
+    payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    payload["retrieve_filters"] = RF
 
-    # Let the generator do grounding + markers + finalization
-    out = generate_email(payload=req.model_dump(), ctx=ctx)
+    out = generate_email(payload=payload, ctx=ctx)
 
-    # Construct the typed piece
     email = EmailPiece(
         subjects=out.get("subjects", []),
         body_md=out.get("body_md", out.get("email_md", "")),
         citations=_map_citations(out.get("citations")),
     )
-
-    # Return typed + legacy keys
     return {
         "email": email,
-        "email_md": email.body_md,                              # legacy
-        "email_sources": [c.model_dump() for c in email.citations],  # legacy
-        # NOTE: We intentionally do NOT return top-level "subjects" anymore.
-        # The UI should read subjects from resp["email"]["subjects"].
+        "email_md": email.body_md,
+        "email_sources": [c.model_dump() for c in email.citations],
     }
 
-
 @router.post("/narrative", response_model=GenerateNarrativeResponseCompat)
-def post_generate_narrative(req: GenerateRequest):
+async def post_generate_narrative(req: GenerateRequest, request: Request):
+    raw = await request.json()
+    rf_raw = (
+        raw.get("retrieve_filters")
+        or raw.get("retrieveFilters")
+        or raw.get("filters")
+        or (raw.get("options", {}) or {}).get("retrieve_filters")
+        or (raw.get("options", {}) or {}).get("retrieveFilters")
+        or None
+    )
+
+    RF = _normalize_rf(rf_raw)
+    if RF["date_from"] is None and isinstance(rf_raw, dict) and "dateFrom" in rf_raw:
+        RF["date_from"] = rf_raw.get("dateFrom")
+    if RF["date_to"] is None and isinstance(rf_raw, dict) and "dateTo" in rf_raw:
+        RF["date_to"] = rf_raw.get("dateTo")
+
     query = f"{req.campaign_brief}\n{req.org_brief}"
-    filters = req.filters.model_dump(exclude_none=True) if req.filters else None
+    k = req.k or 8
+    ctx = retrieve(query=query, kb_path=KB_PATH, k=k, filters=RF)
 
-    try:
-        ctx = retrieve(query=query, kb_path=KB_PATH, k=req.k, filters=filters)
-    except FileNotFoundError:
-        empty_narr = NarrativePiece(body_md="", citations=[])
-        return {
-            "narrative": empty_narr,
-            "narrative_md": empty_narr.body_md,     # legacy
-            "narrative_sources": [],                # legacy
-        }
+    payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    payload["retrieve_filters"] = RF
 
-    out = generate_narrative(payload=req.model_dump(), ctx=ctx)
+    out = generate_narrative(payload=payload, ctx=ctx)
 
     narrative = NarrativePiece(
         body_md=out.get("body_md", out.get("narrative_md", "")),
         citations=_map_citations(out.get("citations")),
     )
-
     return {
         "narrative": narrative,
-        "narrative_md": narrative.body_md,                         # legacy
-        "narrative_sources": [c.model_dump() for c in narrative.citations],  # legacy
+        "narrative_md": narrative.body_md,
+        "narrative_sources": [c.model_dump() for c in narrative.citations],
     }
