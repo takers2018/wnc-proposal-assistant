@@ -1,13 +1,82 @@
 import os, textwrap, json, re
+from typing import List, Dict, Any, Tuple
+from datetime import datetime
+
 from dotenv import load_dotenv
 load_dotenv()
-from typing import List, Dict, Any, Tuple
+
 from openai import OpenAI
 from app.services.citations import build_sources, insert_markers_from_sequence
 from app.services.postprocess import rebuild_sources_in_marker_order, sanitize_on_no_sources
 
 MODEL = os.environ.get("MODEL", "gpt-4o-mini")
 client = OpenAI()
+
+# ----------------- helpers -----------------
+
+def _parse_iso_or_none(s: str | None):
+    try:
+        return datetime.fromisoformat(s) if s else None
+    except Exception:
+        return None
+
+def _ctx_matches_filters(c: Dict[str, Any], f: Dict[str, Any]) -> bool:
+    if not f:
+        return True
+
+    # counties
+    if f.get("counties"):
+        cty = (c.get("county") or "").strip()
+        if not cty or cty not in f["counties"]:
+            return False
+
+    # topics (any overlap)
+    if f.get("topics"):
+        mt = c.get("topics") or []
+        if not any(t in mt for t in f["topics"]):
+            return False
+
+    # strict date window: undated chunks FAIL when a date filter is present
+    df = f.get("date_from")
+    dt = f.get("date_to")
+    if df or dt:
+        d  = _parse_iso_or_none(c.get("date"))
+        d1 = _parse_iso_or_none(df) if df else None
+        d2 = _parse_iso_or_none(dt) if dt else None
+        if d is None:
+            return False
+        if d1 and d < d1:
+            return False
+        if d2 and d > d2:
+            return False
+
+    return True
+
+def _filter_ctx(ctx: List[Dict[str, Any]], retrieve_filters: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    if not retrieve_filters:
+        return ctx
+    return [c for c in ctx if _ctx_matches_filters(c, retrieve_filters)]
+
+def _norm_rf(rf: Dict[str, Any] | None) -> Dict[str, Any]:
+    """
+    Normalize either schema to {date_from,date_to,counties,topics}.
+    Accepts:
+      - {"date":{"from","to"},"county":[...],"topic":[...]}
+      - {"date_from","date_to","counties","topics"}
+    """
+    out = {"date_from": None, "date_to": None, "counties": None, "topics": None}
+    if not rf:
+        return out
+    rf = dict(rf)
+    if "date" in rf and isinstance(rf["date"], dict):
+        out["date_from"] = rf["date"].get("from")
+        out["date_to"]   = rf["date"].get("to")
+    else:
+        out["date_from"] = rf.get("date_from")
+        out["date_to"]   = rf.get("date_to")
+    out["counties"] = rf.get("counties") or rf.get("county")
+    out["topics"]   = rf.get("topics") or rf.get("topic")
+    return out
 
 def _chat(messages, json_mode: bool = False):
     kwargs = {"model": MODEL, "messages": messages, "temperature": 0.4}
@@ -16,7 +85,6 @@ def _chat(messages, json_mode: bool = False):
     try:
         return client.chat.completions.create(**kwargs).choices[0].message.content
     except Exception:
-        # Retry once without JSON mode (models/SDKs that don't support response_format)
         if json_mode:
             return client.chat.completions.create(model=MODEL, messages=messages, temperature=0.4).choices[0].message.content
         raise
@@ -31,29 +99,20 @@ def _sanitize_preserve_urls(md: str) -> str:
         urls.append(m.group(1))
         return f"__URL_{len(urls)-1}__"
     md = _URL_RE.sub(_stash, md)
-
-    # ✅ Keep this section minimal; do NOT insert spaces around '.' or inside tokens.
-    # If you previously added any rules like "add spaces around dots", delete them.
-    # Example of safe normalizations:
     md = md.replace("\u00A0", " ")
-
     for i, u in enumerate(urls):
         md = md.replace(f"__URL_{i}__", u)
     return md
 
 def _strip_model_sources(md: str) -> str:
-    """Remove any model-written 'Sources' / 'References' sections."""
     if not md:
         return md
-    # Kill trailing 'Sources' headings and content
     md = re.sub(r"(?is)\n+#+\s*(sources|references)\b.*$", "", md)
-    # Kill standalone lines like "Sources:" followed by anything
     md = re.sub(r"(?im)^\s*(sources|references)\s*:\s*$.*", "", md)
     return md
 
 def _paragraph_blocks(text: str) -> List[str]:
-    """Split by blank lines, keep non-empty paragraphs."""
-    return [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()] 
+    return [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
 
 SYSTEM_PROMPT_BASE = """
 You are a nonprofit fundraising writer serving Western North Carolina disaster recovery.
@@ -73,7 +132,7 @@ No extra prose, no markdown fences.
 """
 
 NARRATIVE_SYSTEM_PROMPT = SYSTEM_PROMPT_BASE + """
-Output ONLY plain Markdown (no JSON). Do not use headings (#, ##, ###).
+Output ONLY plain Markdown (no JSON). Do not use headings (#, ##, ###!).
 Write six paragraphs in this exact order, each starting with a bold label followed by a period:
 
 **Need/Problem.** …
@@ -87,49 +146,15 @@ End with a 'Sources' list that maps [n] → title and URL.
 Keep normal paragraph wrapping; never insert a hard line break inside a sentence or a number.
 """
 
-def _fix_url_line(line: str) -> str:
-    if "http" not in line:
-        return line
-
-    # 1) Collapse 'https: //' -> 'https://'
-    line = re.sub(r'\b(https?)\s*:\s*/\s*/', r'\1://', line, flags=re.I)
-
-    # 2) Remove spaces immediately after protocol: 'https://  example' -> 'https://example'
-    line = re.sub(r'(?i)(https?://)\s+', r'\1', line)
-
-    # 3) Iteratively remove spaces around dots, slashes, and query separators
-    #    anywhere AFTER the protocol (handles 'example. org', 'path / to', '? q=foo')
-    for _ in range(3):  # a few passes to catch cascades
-        line = re.sub(r'(?i)(https?://[^\n]*?)\s*\.\s*', r'\1.', line)
-        line = re.sub(r'(?i)(https?://[^\n]*?)\s*/\s*', r'\1/', line)
-        line = re.sub(r'(?i)(https?://[^\n]*?)\s*([?#&=])\s*', r'\1\2', line)
-
-    return line
-
 def _sanitize_markdown(md: str) -> str:
     s = md.replace("\r\n", "\n")
-
-    # --- Normalize all funky spaces first (incl. NBSP) ---
-    s = s.replace("\u00A0", " ")  # NBSP
-    s = re.sub(r"[\u2000-\u200A\u202F\u205F\u3000]", " ", s)  # thin/figure/narrow/ideographic, etc.
-    # Strip zero-width chars
+    s = s.replace("\u00A0", " ")
+    s = re.sub(r"[\u2000-\u200A\u202F\u205F\u3000]", " ", s)
     s = re.sub(r"[\u200B-\u200D\u2060\uFEFF]", "", s)
-
-    # Normalize dashes to hyphen
     s = s.replace("–", "-").replace("—", "-")
-
-    # Remove space after $ before digits: "$ 250,000" -> "$250,000"
     s = re.sub(r"\$\s+(?=\d)", "$", s)
-
-    # Fix '**Label. **' -> '**Label.**'
-    s = re.sub(r'^\s*\*\*(.+?)\.\s*\*\*\s*$', r'**\1.**', s, flags=re.MULTILINE)
-
-    # --- Numeric & money formatting ---
-    # 250,\n000 or 6, 000 -> 250,000 / 6,000
     s = re.sub(r"(?<=\d),(?:\s|\n)+(?=\d)", ",", s)
-    # Tighten numeric ranges like 6 - 10 -> 6-10
     s = re.sub(r"(?<=\d)\s*-\s*(?=\d)", "-", s)
-    # Tighten unit "k/m/b" with or without $: "10 k" -> "10k", "$ 250 k" -> "$250k"
     s = re.sub(
         r"(?i)\$?\s*(\d[\d,]*(?:\.\d+)?)\s*([kmb])\b",
         lambda m: f"${m.group(1)}{m.group(2).lower()}"
@@ -137,71 +162,35 @@ def _sanitize_markdown(md: str) -> str:
         else f"{m.group(1)}{m.group(2).lower()}",
         s,
     )
-    # Add space after comma before a 4-digit year: "October 15,2025" -> "October 15, 2025"
     s = re.sub(r"(?<=\d),(?=\d{4}\b)", ", ", s)
-    # If "10kto" appears, ensure a space before "to"
     s = re.sub(r"(?i)(\d[\d,]*(?:\.\d+)?[kmb])(?=to\b)", r"\1 ", s)
-
-    # Words split by linebreaks / hyphenation
-    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)          # micro-\n grants -> microgrants
-    s = re.sub(r"(?<=\w)\n(?=\w)", " ", s)          # micro\ngrants -> micro grants
-    s = re.sub(r"([^\n])\n(?!\n|[#\-\*]|$)", r"\1 ", s)  # single newline inside paragraph -> space
-
-    # Spacing around punctuation/citations
-    s = re.sub(r"\s+,", ",", s)                               # " ," -> ","
-    s = re.sub(r",(?!\s|\d)", ", ", s)                        # add space after comma only if next isn't space or digit
-    s = re.sub(r"([.;:!?])(?=\S)", r"\1 ", s)                 # add space after . ; : ! ? when glued
-    s = re.sub(r"(\])(?=\w)", r"\1 ", s)                      # "]Your" -> "] Your"
-
-    # Digit→letter glue (avoid splitting units and ordinals)
+    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)
+    s = re.sub(r"(?<=\w)\n(?=\w)", " ", s)
+    s = re.sub(r"([^\n])\n(?!\n|[#\-\*]|$)", r"\1 ", s)
+    s = re.sub(r"\s+,", ",", s)
+    s = re.sub(r",(?!\s|\d)", ", ", s)
+    s = re.sub(r"([.;:!?])(?=\S)", r"\1 ", s)
+    s = re.sub(r"(\])(?=\w)", r"\1 ", s)
     s = re.sub(r"(?<=\d)(?=[A-Za-z])(?!k\b|m\b|b\b|st\b|nd\b|rd\b|th\b)", " ", s)
-
-    # Fix '**Label. **' (with an extra space) -> '**Label.**'
     s = re.sub(r'\*\*(.+?)\.\s*\*\*', r'**\1.**', s)
-
-    # (Intentionally NOT splitting letter→digit to avoid breaking H2O/COVID-19/etc.)
-
-    # Collapse extras
     s = re.sub(r"[ \t]{2,}", " ", s)
+    return "\n".join(_fix_url_line(ln) for ln in s.splitlines()).strip()
 
-    # Normalize any URLs that may contain spaces (in Sources lines, etc.)
-    s = "\n".join(_fix_url_line(ln) for ln in s.splitlines())
-
-    return s.strip()
-
-def _sanitize_narrative_markdown(md: str) -> str:
-    s = _sanitize_markdown(md)
-
-    # Enforce six inline bold labels (no big headings, no stray asterisks)
-    labels = [
-        "Need/Problem",
-        "Program/Intervention",
-        "Budget Summary & Unit Economics",
-        "Outcomes & Reporting Plan",
-        "Equity & Community Context",
-        "Organizational Capacity",
-    ]
-
-    # 1) Convert heading or label lines into "**Label.** " at start of a paragraph
-    for lab in labels:
-        # Demote headings like "### Need/Problem"
-        s = re.sub(rf"(?m)^\s*#{1,6}\s*{re.escape(lab)}\s*$", f"**{lab}.** ", s)
-        # Convert plain label lines like "Need/Problem:" or "Need/Problem."
-        s = re.sub(rf"(?m)^\s*{re.escape(lab)}\s*[:\.]\s*$", f"**{lab}.** ", s)
-        # Normalize any "**Label. **" or "** Label **" variants
-        s = re.sub(rf"(?m)^\s*\*\*\s*{re.escape(lab)}\s*[\.:]?\s*\*\*\s*$", f"**{lab}.** ", s)
-
-    # 2) If a label ended up on its own line, join it with the next line as one paragraph
-    s = re.sub(r"(?m)^\s*(\*\*[^*]+?\.\*\*)\s*\n(?!\n)", r"\1 ", s)
-
-    return s.strip()
+def _fix_url_line(line: str) -> str:
+    if "http" not in line:
+        return line
+    line = re.sub(r'\b(https?)\s*:\s*/\s*/', r'\1://', line, flags=re.I)
+    line = re.sub(r'(?i)(https?://)\s+', r'\1', line)
+    for _ in range(3):
+        line = re.sub(r'(?i)(https?://[^\n]*?)\s*\.\s*', r'\1.', line)
+        line = re.sub(r'(?i)(https?://[^\n]*?)\s*/\s*', r'\1/', line)
+        line = re.sub(r'(?i)(https?://[^\n]*?)\s*([?#&=])\s*', r'\1\2', line)
+    return line
 
 def _sanitize_inline_text(x: str) -> str:
-    """Pre-clean short user inputs so odd Unicode/linebreaks don't propagate into prompts or outputs."""
     if not x:
         return x
     s = _sanitize_markdown(x)
-    # Force single-line to avoid accidental headings/blocks from user pastes
     s = re.sub(r"\s*\n\s*", " ", s)
     return s.strip()
 
@@ -215,16 +204,29 @@ def _format_context_blocks(ctx: List[Dict[str, Any]]) -> str:
     return "\n\n".join(blocks)
 
 def finalize_output(body_md: str, sources: list[dict]) -> tuple[str, list[dict]]:
-    """
-    Renumber [n] markers to match first-use order and reorder sources to 1..m.
-    Assumes body_md already has [n] markers and 'sources' was built from ctx.
-    """
     body_md, sources = rebuild_sources_in_marker_order(body_md, sources)
     return body_md, sources
 
+# ----------------- email -----------------
+
 def generate_email(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Dict[str, Any]:
-    context_blocks = _format_context_blocks(ctx) if ctx else "No context available."
-        # sanitize inbound user fields before building the prompt
+    # Defensive: re-filter ctx (supports either schema from UI/API)
+    rf_raw = payload.get("retrieve_filters") or {}
+    RF = _norm_rf(rf_raw)
+    if any([RF["date_from"], RF["date_to"], RF["counties"], RF["topics"]]):
+        ctx2 = _filter_ctx(ctx, RF)
+        if len(ctx2) == 0:
+            ctx = []
+            context_blocks = "No context available."
+        else:
+            ctx = ctx2
+            context_blocks = _format_context_blocks(ctx)
+    else:
+        context_blocks = _format_context_blocks(ctx) if ctx else "No context available."
+
+    print(f"[DBG] gen_email rf={RF} len(ctx)_after_refilter={len(ctx)}")
+
+    # sanitize inbound user fields before building the prompt
     payload = {
         **payload,
         "org_brief": _sanitize_inline_text(payload.get("org_brief", "")),
@@ -255,27 +257,24 @@ def generate_email(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Dict[s
     ---
     {context_blocks}
     """
+    if not ctx:
+        user_prompt += "\n\nNo citations available. Do not include bracketed citations or a Sources section."
+
     messages = [
         {"role": "system", "content": EMAIL_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
 
-    if not ctx:
-        user_prompt += "\n\nNo citations available. Do not include bracketed citations or a Sources section."
-
     raw = _chat(messages, json_mode=True)  # try JSON mode first
 
     # Parse JSON or fall back gracefully
-    subjects, ps, sources = [], "", []
+    subjects, ps_raw, sources = [], "", []
     try:
         obj = json.loads(raw)
     except Exception:
-        # Try to salvage a JSON object if wrapped in prose
         m = re.search(r"\{[\s\S]*\}$", raw.strip())
         obj = json.loads(m.group(0)) if m else {}
-
     if not obj:
-        # Last-resort heuristic: split lines; take first 3 as subjects, rest as body
         lines = [ln.strip("-• ").strip() for ln in raw.splitlines() if ln.strip()]
         subjects = lines[:3]
         body_raw = "\n".join(lines[3:]) if len(lines) > 3 else raw
@@ -309,22 +308,38 @@ def generate_email(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Dict[s
     # ---- Grounded citations ----
     citations = sources_built if sources_built else []
 
-    # ---- If no sources, remove any stray [n] and 'Sources' sections ----
-    body, citations = sanitize_on_no_sources(body, citations)
+    # ---- Strong guard: if no context (or no sources), strip stray [n] and trailing Sources ----
+    print(f"[DBG] gen_email: len(ctx)={len(ctx)} before_sanitize markers?={bool(re.search(r'\\[\\d+\\]', body))}")
+    if not ctx or not citations:
+        body, citations = sanitize_on_no_sources(body, [])
+    print(f"[DBG] gen_email: after_sanitize markers?={bool(re.search(r'\\[\\d+\\]', body))} len(citations)={len(citations)}")
 
     # ---- Finalize once: renumber [n] and reorder sources ----
     body, citations = finalize_output(body, citations)
 
-    return {
-        "subjects": subjects,
-        "body_md": body,
-        "citations": citations,
-    }
+    print(f"[DBG] gen_email: len(ctx)={len(ctx)}  before_sanitize markers?={bool(re.search(r'\\[\\d+\\]', body))}")
 
+    return {"subjects": subjects, "body_md": body, "citations": citations}
+
+# ----------------- narrative -----------------
 
 def generate_narrative(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Dict[str, Any]:
-    context_blocks = _format_context_blocks(ctx) if ctx else "No context available."
-        # sanitize inbound user fields before building the prompt
+    # Defensive: re-filter ctx (supports either schema from UI/API)
+    rf_raw = payload.get("retrieve_filters") or {}
+    RF = _norm_rf(rf_raw)
+    if any([RF["date_from"], RF["date_to"], RF["counties"], RF["topics"]]):
+        ctx2 = _filter_ctx(ctx, RF)
+        if len(ctx2) == 0:
+            ctx = []
+            context_blocks = "No context available."
+        else:
+            ctx = ctx2
+            context_blocks = _format_context_blocks(ctx)
+    else:
+        context_blocks = _format_context_blocks(ctx) if ctx else "No context available."
+
+    print(f"[DBG] gen_narr rf={RF} len(ctx)_after_refilter={len(ctx)}")
+
     payload = {
         **payload,
         "org_brief": _sanitize_inline_text(payload.get("org_brief", "")),
@@ -348,18 +363,18 @@ def generate_narrative(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Di
     ---
     {context_blocks}
     """
+    if not ctx:
+        user_prompt += "\n\nNo citations available. Do not include bracketed citations or a Sources section."
+
     messages = [
         {"role": "system", "content": NARRATIVE_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
 
-    if not ctx:
-        user_prompt += "\n\nNo citations available. Do not include bracketed citations or a Sources section."
-
     resp = client.chat.completions.create(model=MODEL, messages=messages, temperature=0.4)
     content = resp.choices[0].message.content
 
-    # Resilience: if the model accidentally returns JSON, parse body_md
+    # If model accidentally returns JSON, unwrap it
     if content.strip().startswith("{"):
         try:
             obj = json.loads(content)
@@ -367,7 +382,7 @@ def generate_narrative(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Di
         except Exception:
             pass
 
-    # ---- SANITIZE (preserve URLs), strip any model-written Sources ----
+    # ---- SANITIZE (preserve URLs), strip model-written Sources ----
     content = _sanitize_preserve_urls(content)
     content = _strip_model_sources(content)
 
@@ -386,10 +401,14 @@ def generate_narrative(payload: Dict[str, Any], ctx: List[Dict[str, Any]]) -> Di
     # ---- Grounded citations ----
     citations = sources_built if sources_built else []
 
-    # ---- If no sources, remove any stray [n] and 'Sources' sections ----
-    content, citations = sanitize_on_no_sources(content, citations)
+    # ---- Strong guard: if no context (or no sources), strip stray [n] and trailing Sources ----
+    print(f"[DBG] gen_narr: len(ctx)={len(ctx)} before_sanitize markers?={bool(re.search(r'\\[\\d+\\]', content))}")
+    if not ctx or not citations:
+        content, citations = sanitize_on_no_sources(content, [])
+    print(f"[DBG] gen_narr: after_sanitize markers?={bool(re.search(r'\\[\\d+\\]', content))} len(citations)={len(citations)}")
 
     # ---- Finalize once: renumber [n] and reorder sources ----
     content, citations = finalize_output(content, citations)
+    print(f"[DBG] gen_narr: len(ctx)={len(ctx)}  before_sanitize markers?={bool(re.search(r'\\[\\d+\\]', content))}")
 
     return {"body_md": content, "citations": citations}

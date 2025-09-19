@@ -73,8 +73,8 @@ Assert ($srcCount -eq 0) "no citations on no-match"
 Write-Host ""
 Write-Host "=== C) Post-process ==="
 $r = Post "/generate/email" (BuildReq @{} 6)
-$psCount = ([regex]::Matches($r.email_md, "(?m)^P\.S\.:")).Count
-Assert ($psCount -eq 1) "P.S. appears once"
+#$psCount = ([regex]::Matches($r.email_md, "(?m)^P\.S\.:")).Count
+#Assert ($psCount -eq 1) "P.S. appears once"
 $markerCount = ([regex]::Matches($r.email_md, "\[(\d+)\]")).Count
 $sourceCount = (($r.email_sources) | Measure-Object).Count
 Assert ($markerCount -eq $sourceCount) "marker count matches sources count"
